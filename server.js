@@ -8,6 +8,7 @@ const server = http.createServer(app);
 
 // CORS configuration for production
 const allowedOrigins = [
+  'https://smart-parking-dashboard-delta.vercel.app',
   'https://smart-parking-dashboard.vercel.app',
   'http://localhost:3000',
   'http://localhost:3001'
