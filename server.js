@@ -6,7 +6,6 @@ const cors = require('cors');
 const app = express();
 const server = http.createServer(app);
 
-// CORS configuration for production
 const allowedOrigins = [
   'https://smart-parking-dashboard-delta.vercel.app',
   'https://smart-parking-dashboard.vercel.app',
@@ -71,7 +70,88 @@ app.post('/update', (req, res) => {
   }
 
   try {
-    if (data.type === 'slot_occupied') {
+    // 🆕 XỬ LÝ vehicle_entry VÀ vehicle_reentry TRƯỚC
+    if (data.type === 'vehicle_entry') {
+      const existingVehicle = state.vehicles.find(v => v.cardUID === data.id && v.status === 'parked');
+      if (!existingVehicle) {
+        state.vehicles.push({
+          cardUID: data.id,
+          entryTime: new Date().toISOString(),
+          status: 'parked',
+          slotNumber: 0,
+          parkStartTime: new Date().toISOString(),
+          currentFee: 0
+        });
+        
+        console.log('✅ Vehicle added to tracking:', data.id);
+      }
+      
+      state.logs.unshift({
+        time: new Date().toISOString(),
+        msg: `🚗 VÀO: Xe ${data.id} đã vào bãi đỗ`,
+        type: 'entry'
+      });
+      
+      state.available = data.available || state.available;
+    }
+    else if (data.type === 'vehicle_reentry') {
+      // Tìm xe và cập nhật lại trạng thái
+      const vehicleIndex = state.vehicles.findIndex(v => v.cardUID === data.id);
+      if (vehicleIndex !== -1) {
+        state.vehicles[vehicleIndex].status = 'parked';
+        state.vehicles[vehicleIndex].entryTime = new Date().toISOString();
+        state.vehicles[vehicleIndex].parkStartTime = new Date().toISOString();
+        state.vehicles[vehicleIndex].slotNumber = 0;
+        
+        console.log('✅ Vehicle re-entry updated:', data.id);
+      } else {
+        // Nếu không tìm thấy, tạo mới
+        state.vehicles.push({
+          cardUID: data.id,
+          entryTime: new Date().toISOString(),
+          status: 'parked',
+          slotNumber: 0,
+          parkStartTime: new Date().toISOString(),
+          currentFee: 0
+        });
+      }
+      
+      state.logs.unshift({
+        time: new Date().toISOString(),
+        msg: `🔁 VÀO LẠI: Xe ${data.id} đã vào lại bãi đỗ`,
+        type: 'entry'
+      });
+      
+      state.available = data.available || state.available;
+    }
+    else if (data.type === 'entry_time') {
+      const timeInfo = data.result.replace(/ENTRY_TIME_|REENTRY_TIME_/, '');
+      state.logs.unshift({
+        time: new Date().toISOString(),
+        msg: `⏰ Xe ${data.id} vào lúc: ${timeInfo}`,
+        type: 'time'
+      });
+    }
+    // 🆕 XỬ LÝ vehicle_parked - PHẢI CÓ XE TRONG DANH SÁCH
+    else if (data.type === 'vehicle_parked') {
+      const vehicleIndex = state.vehicles.findIndex(v => v.cardUID === data.id && v.status === 'parked');
+      
+      if (vehicleIndex !== -1) {
+        const slotInfo = data.result.replace('PARKED_SLOT_', '');
+        state.vehicles[vehicleIndex].slotNumber = parseInt(slotInfo);
+        
+        console.log('✅ Vehicle parked in slot:', data.id, '-> Slot', slotInfo);
+        
+        state.logs.unshift({
+          time: new Date().toISOString(),
+          msg: `🅿️ Xe ${data.id} đã đỗ vào slot ${slotInfo}`,
+          type: 'parking'
+        });
+      } else {
+        console.warn('⚠️ Vehicle not found for parking:', data.id);
+      }
+    }
+    else if (data.type === 'slot_occupied') {
       const idx = parseInt(data.id) - 1;
       if (idx >= 0 && idx < state.slots.length) {
         state.slots[idx] = 1;
@@ -97,49 +177,11 @@ app.post('/update', (req, res) => {
         });
       }
     }
-    else if (data.type === 'vehicle_entry') {
-      // Add vehicle to tracking
-      const existingVehicle = state.vehicles.find(v => v.cardUID === data.id && v.status === 'parked');
-      if (!existingVehicle) {
-        state.vehicles.push({
-          cardUID: data.id,
-          entryTime: new Date().toISOString(),
-          status: 'parked',
-          slotNumber: 0,
-          parkStartTime: null,
-          currentFee: 0
-        });
-      }
-      
-      state.logs.unshift({
-        time: new Date().toISOString(),
-        msg: `🚗 VÀO: Xe ${data.id} đã vào bãi đỗ`,
-        type: 'entry'
-      });
-      
-      state.available = data.available || state.available;
-    } 
-    else if (data.type === 'vehicle_parked') {
-      // Update vehicle with slot info
-      const vehicleIndex = state.vehicles.findIndex(v => v.cardUID === data.id && v.status === 'parked');
-      if (vehicleIndex !== -1) {
-        const slotInfo = data.result.replace('PARKED_SLOT_', '');
-        state.vehicles[vehicleIndex].slotNumber = parseInt(slotInfo);
-        state.vehicles[vehicleIndex].parkStartTime = new Date().toISOString();
-        
-        state.logs.unshift({
-          time: new Date().toISOString(),
-          msg: `🅿️ Xe ${data.id} đã đỗ vào slot ${slotInfo}`,
-          type: 'parking'
-        });
-      }
-    }
     else if (data.type === 'vehicle_left_slot') {
       const vehicleIndex = state.vehicles.findIndex(v => v.cardUID === data.id && v.status === 'parked');
       if (vehicleIndex !== -1) {
         const slotInfo = data.result.replace('LEFT_SLOT_', '');
         state.vehicles[vehicleIndex].slotNumber = 0;
-        state.vehicles[vehicleIndex].parkStartTime = null;
         
         state.logs.unshift({
           time: new Date().toISOString(),
@@ -147,14 +189,6 @@ app.post('/update', (req, res) => {
           type: 'movement'
         });
       }
-    }
-    else if (data.type === 'entry_time') {
-      const timeInfo = data.result.replace('ENTRY_TIME_', '');
-      state.logs.unshift({
-        time: new Date().toISOString(),
-        msg: `⏰ Xe ${data.id} vào lúc: ${timeInfo}`,
-        type: 'time'
-      });
     }
     else if (data.type === 'vehicle_exiting') {
       state.logs.unshift({
@@ -172,16 +206,14 @@ app.post('/update', (req, res) => {
       });
     }
     else if (data.type === 'payment_info') {
-      // Remove vehicle and calculate revenue
       const vehicleIndex = state.vehicles.findIndex(v => v.cardUID === data.id && v.status === 'parked');
       if (vehicleIndex !== -1) {
         state.vehicles[vehicleIndex].status = 'exited';
         state.vehicles[vehicleIndex].exitTime = new Date().toISOString();
         
-        // Extract fee from result
         const feeMatch = data.result.match(/FEE_(\d+)_TIME_(\d+)m/);
         if (feeMatch) {
-          const fee = parseInt(feeMatch[1]) * 100; // Convert to VND
+          const fee = parseInt(feeMatch[1]) * 100;
           const parkTime = feeMatch[2];
           state.revenue += fee;
           state.totalTransactions++;
@@ -200,10 +232,8 @@ app.post('/update', (req, res) => {
       state.available = parseInt(data.result.replace('AVAILABLE_', '')) || state.available;
     }
 
-    // Keep logs reasonable
     if (state.logs.length > 200) state.logs = state.logs.slice(0, 100);
 
-    // Broadcast to all connected clients
     io.emit('update', state);
     
     return res.json({ ok: true, state: state });
@@ -213,12 +243,10 @@ app.post('/update', (req, res) => {
   }
 });
 
-// Get current state
 app.get('/state', (req, res) => {
   res.json(state);
 });
 
-// Health check
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
@@ -230,7 +258,6 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Test Socket.IO connection
 app.get('/test-socket', (req, res) => {
   res.json({ 
     message: 'Socket.IO server is running',
@@ -239,7 +266,6 @@ app.get('/test-socket', (req, res) => {
   });
 });
 
-// Reset system (for testing)
 app.post('/reset', (req, res) => {
   state = {
     total: 5,
@@ -260,11 +286,9 @@ app.post('/reset', (req, res) => {
   res.json({ ok: true, msg: 'System reset' });
 });
 
-// Socket connection handling
 io.on('connection', (socket) => {
   console.log('✅ Client connected:', socket.id);
   
-  // Send current state to newly connected client
   socket.emit('update', state);
   
   socket.on('disconnect', (reason) => {
