@@ -11,24 +11,38 @@ const allowedOrigins = [
   'https://smart-parking-dashboard-delta.vercel.app',
   'https://smart-parking-dashboard.vercel.app',
   'http://localhost:3000',
-  'http://localhost:3001'
+  'http://localhost:3001',
+  'http://localhost:8080'
 ];
 
 const io = new Server(server, {
   cors: {
     origin: function (origin, callback) {
       if (!origin) return callback(null, true);
-      if (allowedOrigins.indexOf(origin) === -1) {
+      if (allowedOrigins.indexOf(origin) !== -1 || origin.includes('render.com') || origin.includes('vercel.app')) {
+        return callback(null, true);
+      } else {
         const msg = 'The CORS policy for this site does not allow access from the specified Origin.';
         return callback(new Error(msg), false);
       }
-      return callback(null, true);
     },
-    methods: ["GET", "POST"]
+    methods: ["GET", "POST"],
+    credentials: true
   }
 });
 
-app.use(cors());
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1 || origin.includes('render.com') || origin.includes('vercel.app')) {
+      return callback(null, true);
+    } else {
+      return callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true
+}));
+
 app.use(express.json());
 
 // State management
@@ -39,7 +53,12 @@ let state = {
   logs: [],
   vehicles: [],
   revenue: 0,
-  totalTransactions: 0
+  totalTransactions: 0,
+  systemConfig: {
+    rfidType: "Single Reader (Entry/Exit)",
+    pricing: "500 VND/minute",
+    slots: 5
+  }
 };
 
 // API Routes
@@ -52,19 +71,32 @@ app.post('/update', (req, res) => {
   }
 
   try {
-    if (data.type === 'slot_change') {
+    if (data.type === 'slot_occupied') {
       const idx = parseInt(data.id) - 1;
       if (idx >= 0 && idx < state.slots.length) {
-        state.slots[idx] = data.result === 'OCCUPIED' ? 1 : 0;
+        state.slots[idx] = 1;
         state.available = state.total - state.slots.reduce((a, b) => a + b, 0);
         
         state.logs.unshift({
           time: new Date().toISOString(),
-          msg: `Slot ${idx + 1} -> ${data.result}`,
+          msg: `🅿️ Slot ${data.id} đã có xe đỗ`,
           type: 'slot'
         });
       }
     } 
+    else if (data.type === 'slot_freed') {
+      const idx = parseInt(data.id) - 1;
+      if (idx >= 0 && idx < state.slots.length) {
+        state.slots[idx] = 0;
+        state.available = state.total - state.slots.reduce((a, b) => a + b, 0);
+        
+        state.logs.unshift({
+          time: new Date().toISOString(),
+          msg: `🅿️ Slot ${data.id} đã trống`,
+          type: 'slot'
+        });
+      }
+    }
     else if (data.type === 'vehicle_entry') {
       // Add vehicle to tracking
       const existingVehicle = state.vehicles.find(v => v.cardUID === data.id && v.status === 'parked');
@@ -72,18 +104,50 @@ app.post('/update', (req, res) => {
         state.vehicles.push({
           cardUID: data.id,
           entryTime: new Date().toISOString(),
-          status: 'parked'
+          status: 'parked',
+          slotNumber: 0,
+          parkStartTime: null,
+          currentFee: 0
         });
       }
       
       state.logs.unshift({
         time: new Date().toISOString(),
-        msg: `🚗 VÀO: Xe ${data.id} đã vào bãi đỗ - ${data.result}`,
+        msg: `🚗 VÀO: Xe ${data.id} đã vào bãi đỗ`,
         type: 'entry'
       });
       
       state.available = data.available || state.available;
     } 
+    else if (data.type === 'vehicle_parked') {
+      // Update vehicle with slot info
+      const vehicleIndex = state.vehicles.findIndex(v => v.cardUID === data.id && v.status === 'parked');
+      if (vehicleIndex !== -1) {
+        const slotInfo = data.result.replace('PARKED_SLOT_', '');
+        state.vehicles[vehicleIndex].slotNumber = parseInt(slotInfo);
+        state.vehicles[vehicleIndex].parkStartTime = new Date().toISOString();
+        
+        state.logs.unshift({
+          time: new Date().toISOString(),
+          msg: `🅿️ Xe ${data.id} đã đỗ vào slot ${slotInfo}`,
+          type: 'parking'
+        });
+      }
+    }
+    else if (data.type === 'vehicle_left_slot') {
+      const vehicleIndex = state.vehicles.findIndex(v => v.cardUID === data.id && v.status === 'parked');
+      if (vehicleIndex !== -1) {
+        const slotInfo = data.result.replace('LEFT_SLOT_', '');
+        state.vehicles[vehicleIndex].slotNumber = 0;
+        state.vehicles[vehicleIndex].parkStartTime = null;
+        
+        state.logs.unshift({
+          time: new Date().toISOString(),
+          msg: `🚗 Xe ${data.id} đã rời slot ${slotInfo}`,
+          type: 'movement'
+        });
+      }
+    }
     else if (data.type === 'entry_time') {
       const timeInfo = data.result.replace('ENTRY_TIME_', '');
       state.logs.unshift({
@@ -115,36 +179,22 @@ app.post('/update', (req, res) => {
         state.vehicles[vehicleIndex].exitTime = new Date().toISOString();
         
         // Extract fee from result
-        const feeMatch = data.result.match(/FEE_(\d+)_TIME_(.+)/);
+        const feeMatch = data.result.match(/FEE_(\d+)_TIME_(\d+)m/);
         if (feeMatch) {
-          const fee = parseInt(feeMatch[1]);
+          const fee = parseInt(feeMatch[1]) * 100; // Convert to VND
           const parkTime = feeMatch[2];
           state.revenue += fee;
           state.totalTransactions++;
           
           state.logs.unshift({
             time: new Date().toISOString(),
-            msg: `💰 THANH TOÁN: Xe ${data.id} - ${parkTime} - Phí: ${fee}K VND`,
+            msg: `💰 THANH TOÁN: Xe ${data.id} - ${parkTime} phút - Phí: ${fee} VND`,
             type: 'payment'
           });
         }
       }
       
       state.available = data.available || state.available;
-    }
-    else if (data.type === 'slot_occupied') {
-      state.logs.unshift({
-        time: new Date().toISOString(),
-        msg: `🅿️ Slot ${data.id} đã có xe đỗ`,
-        type: 'slot'
-      });
-    }
-    else if (data.type === 'slot_freed') {
-      state.logs.unshift({
-        time: new Date().toISOString(),
-        msg: `🅿️ Slot ${data.id} đã trống`,
-        type: 'slot'
-      });
     }
     else if (data.type === 'slots_update') {
       state.available = parseInt(data.result.replace('AVAILABLE_', '')) || state.available;
@@ -174,7 +224,18 @@ app.get('/health', (req, res) => {
     status: 'OK', 
     timestamp: new Date().toISOString(),
     vehicles: state.vehicles.length,
-    available: state.available
+    available: state.available,
+    server: 'smart-parking-api-asm5.onrender.com',
+    system: '1 RFID System'
+  });
+});
+
+// Test Socket.IO connection
+app.get('/test-socket', (req, res) => {
+  res.json({ 
+    message: 'Socket.IO server is running',
+    connectedClients: io.engine.clientsCount,
+    system: '1 RFID Parking System'
   });
 });
 
@@ -187,7 +248,12 @@ app.post('/reset', (req, res) => {
     logs: [],
     vehicles: [],
     revenue: 0,
-    totalTransactions: 0
+    totalTransactions: 0,
+    systemConfig: {
+      rfidType: "Single Reader (Entry/Exit)",
+      pricing: "500 VND/minute",
+      slots: 5
+    }
   };
   
   io.emit('update', state);
@@ -196,19 +262,25 @@ app.post('/reset', (req, res) => {
 
 // Socket connection handling
 io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
+  console.log('✅ Client connected:', socket.id);
   
   // Send current state to newly connected client
   socket.emit('update', state);
   
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
+  socket.on('disconnect', (reason) => {
+    console.log('❌ Client disconnected:', socket.id, reason);
+  });
+
+  socket.on('error', (error) => {
+    console.error('❌ Socket error:', error);
   });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚗 Smart Parking Server running on port ${PORT}`);
-  console.log(`📍 Health check: http://localhost:${PORT}/health`);
-  console.log(`📍 API endpoint: http://localhost:${PORT}/update`);
+  console.log(`🚗 Smart Parking Server (1 RFID) running on port ${PORT}`);
+  console.log(`📍 Health check: https://smart-parking-api-asm5.onrender.com/health`);
+  console.log(`📍 API endpoint: https://smart-parking-api-asm5.onrender.com/update`);
+  console.log(`📍 Dashboard: https://smart-parking-dashboard-delta.vercel.app`);
+  console.log(`💰 Pricing: 500 VND/minute`);
 });
